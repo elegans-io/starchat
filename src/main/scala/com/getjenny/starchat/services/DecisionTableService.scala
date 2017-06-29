@@ -4,8 +4,10 @@ package com.getjenny.starchat.services
   * Created by Angelo Leto <angelo@getjenny.com> on 01/07/16.
   */
 
+import java.util
+
+import akka.actor.ActorSystem
 import com.getjenny.starchat.entities._
-import org.elasticsearch.action.DocWriteResponse.Result
 
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.collection.immutable.{List, Map}
@@ -17,156 +19,32 @@ import org.elasticsearch.action.update.UpdateResponse
 import org.elasticsearch.action.delete.DeleteResponse
 import org.elasticsearch.action.get.{GetResponse, MultiGetItemResponse, MultiGetRequestBuilder, MultiGetResponse}
 import org.elasticsearch.action.search.{SearchRequestBuilder, SearchResponse, SearchType}
-import org.elasticsearch.index.query.{BoolQueryBuilder, QueryBuilders, QueryBuilder}
+import org.elasticsearch.index.query.{BoolQueryBuilder, QueryBuilder, QueryBuilders, InnerHitBuilder}
 import org.elasticsearch.common.unit._
 
 import scala.collection.JavaConverters._
 import scala.concurrent.duration._
 import org.elasticsearch.search.SearchHit
+import org.elasticsearch.rest.RestStatus
+import com.getjenny.starchat.analyzer.analyzers._
+
+import scala.util.{Failure, Success, Try}
+import akka.event.{Logging, LoggingAdapter}
+import akka.event.Logging._
+import com.getjenny.starchat.SCActorSystem
+import org.elasticsearch.action.admin.indices.refresh.RefreshResponse
+import org.apache.lucene.search.join._
+
 
 /**
   * Implements functions, eventually used by DecisionTableResource, for searching, get next response etc
   */
 class DecisionTableService(implicit val executionContext: ExecutionContext) {
-  val elastic_client = DTElasticClient
+  val elastic_client = DecisionTableElasticClient
+  val log: LoggingAdapter = Logging(SCActorSystem.system, this.getClass.getCanonicalName)
 
-  var regex_map : Map[String, String] =  Map.empty[String, String]
-
-  def getRegex(): Map[String, String] = {
-    val client: TransportClient = elastic_client.get_client()
-    val qb : QueryBuilder = QueryBuilders.matchAllQuery()
-    var scroll_resp : SearchResponse = client.prepareSearch(elastic_client.index_name)
-      .setTypes(elastic_client.type_name)
-      .setQuery(qb)
-      .setFetchSource(Array("state", "regex"), Array.empty[String])
-      .setScroll(new TimeValue(60000))
-      .setSize(1000).get()
-
-    val results : Map[String, String] = scroll_resp.getHits.getHits.toList.map({ case (e) =>
-      val item: SearchHit = e
-      val state : String = item.getId
-      val source : Map[String, Any] = item.getSource.asScala.toMap
-      val regex : String = source.get("regex") match {
-        case Some(t) => t.asInstanceOf[String]
-        case None => ""
-      }
-      (state, regex)
-    }).filter(_._2 != "").toMap
-    return results
-  }
-
-  def loadRegex() : Future[Option[DTRegexLoad]] = {
-    regex_map = getRegex()
-    val dt_regex_load = DTRegexLoad(num_of_entries=regex_map.size)
-    return Future(Option(dt_regex_load))
-  }
-  loadRegex() // load rergex map on startup
-
-  def getNextResponse(request: ResponseRequestIn): Option[ResponseRequestOutOperationResult] = {
-    // calculate and return the ResponseRequestOut
-
-    val user_text: String = if(request.user_input.isDefined) request.user_input.get.text.getOrElse("") else ""
-    val data: Map[String, String] = if(request.values.isDefined)
-      request.values.get.data.getOrElse(Map[String,String]()) else Map[String,String]()
-    val return_value: String =  if(request.values.isDefined) request.values.get.return_value.getOrElse("") else ""
-
-    val return_state : Option[ResponseRequestOutOperationResult] = Option {
-      return_value != "" match {
-        case true => // there is a state in return_value
-          val state: Future[Option[SearchDTDocumentsResults]] = read(List[String](return_value))
-          val res : Option[SearchDTDocumentsResults] = Await.result(state, 30.seconds)
-          if (res.get.total > 0) {
-            val doc : DTDocument = res.get.hits.head.document
-            val state : String = doc.state
-            val max_state_count: Int = doc.max_state_count
-            val regex : String = doc.regex
-            var bubble : String = doc.bubble
-            var action_input : Map[String,String] = doc.action_input
-            val state_data : Map[String, String] = doc.state_data
-            if (data.nonEmpty) {
-              for ((key,value) <- data) {
-                bubble = bubble.replaceAll("%" + key + "%", value)
-                action_input = doc.action_input map {case (ki, vi) =>
-                  val new_value : String = vi.replaceAll("%" + key + "%", value)
-                  (ki, new_value)
-                }
-              }
-            }
-
-            val response_data : ResponseRequestOut = ResponseRequestOut(state = state,
-              max_state_count = max_state_count,
-              regex = regex,
-              bubble = bubble,
-              action = doc.action,
-              data = data,
-              action_input = action_input,
-              state_data = state_data,
-              success_value = doc.success_value,
-              failure_value = doc.failure_value)
-
-            val full_response : ResponseRequestOutOperationResult =
-                ResponseRequestOutOperationResult(ReturnMessageData(200, ""), Option{response_data}) // success
-            full_response
-          } else {
-            val full_response : ResponseRequestOutOperationResult =
-              ResponseRequestOutOperationResult(ReturnMessageData(500,
-                "Error during state retrieval"), null) // internal error
-            full_response
-          }
-        case false => // No states in the return values
-          val min_score = Option{request.min_score.getOrElse( // min_search score
-            Option{elastic_client.query_min_threshold}.getOrElse(0.0f)
-          )}
-          val boost_exact_match_factor = Option{request.boost_exact_match_factor.getOrElse(
-            Option{elastic_client.boost_exact_match_factor}.getOrElse(1.0f)
-          )}
-          val dtDocumentSearch : DTDocumentSearch =
-            DTDocumentSearch(from = Option{0}, size = Option{1}, min_score = min_score,
-              boost_exact_match_factor = boost_exact_match_factor, state = Option{null}, queries = Option{user_text})
-          val state: Future[Option[SearchDTDocumentsResults]] = search(dtDocumentSearch)
-          // search the state with the closest query value, then return that state
-          val res : Option[SearchDTDocumentsResults] = Await.result(state, 30.seconds)
-          if (res.get.total > 0) {
-            val doc : DTDocument = res.get.hits.head.document
-            val state : String = doc.state
-            val max_state_count : Int = doc.max_state_count
-            val regex : String = doc.regex
-            var bubble : String = doc.bubble
-            var action_input : Map[String,String] = doc.action_input
-            val state_data: Map[String, String] = doc.state_data
-            if (data.nonEmpty) {
-              for ((key,value) <- data) {
-                bubble = bubble.replaceAll("%" + key + "%", value)
-                action_input = doc.action_input map {case (ki, vi) =>
-                  val new_value : String = vi.replaceAll("%" + key + "%", value)
-                  (ki, new_value)
-                }
-              }
-            }
-
-            val response_data : ResponseRequestOut = ResponseRequestOut(state = state,
-              max_state_count = max_state_count,
-              regex = regex,
-              bubble = bubble,
-              action = doc.action,
-              data = data,
-              action_input = action_input,
-              state_data = state_data,
-              success_value = doc.success_value,
-              failure_value = doc.failure_value)
-
-            val full_response : ResponseRequestOutOperationResult =
-              ResponseRequestOutOperationResult(ReturnMessageData(200, ""), Option{response_data}) // success
-            full_response
-          } else {
-            val full_response : ResponseRequestOutOperationResult =
-              ResponseRequestOutOperationResult(ReturnMessageData(204, ""), null)  // no data
-            full_response
-          }
-        }
-      }
-    return_state
-  }
+  val queries_score_mode = Map[String, ScoreMode]("min" -> ScoreMode.Min, "max" -> ScoreMode.Max,
+            "avg" -> ScoreMode.Avg, "total" -> ScoreMode.Total)
 
   def search(documentSearch: DTDocumentSearch): Future[Option[SearchDTDocumentsResults]] = {
     val client: TransportClient = elastic_client.get_client()
@@ -188,11 +66,20 @@ class DecisionTableService(implicit val executionContext: ExecutionContext) {
     if (documentSearch.state.isDefined)
       bool_query_builder.must(QueryBuilders.termQuery("state", documentSearch.state.get))
 
+    if (documentSearch.execution_order.isDefined)
+      bool_query_builder.must(QueryBuilders.matchQuery("execution_order", documentSearch.state.get))
+
     if(documentSearch.queries.isDefined) {
-      bool_query_builder.must(QueryBuilders.matchQuery("queries.stem_bm25", documentSearch.queries.get))
-      bool_query_builder.should(
-        QueryBuilders.matchPhraseQuery("queries.raw", documentSearch.queries.get).boost(min_score * boost_exact_match_factor)
-      )
+      val nested_query: QueryBuilder = QueryBuilders.nestedQuery(
+        "queries",
+        QueryBuilders.boolQuery()
+          .must(QueryBuilders.matchQuery("queries.query.stem_bm25", documentSearch.queries.get))
+          .should(QueryBuilders.matchPhraseQuery("queries.query.raw", documentSearch.queries.get)
+            .boost(1 + (min_score * boost_exact_match_factor))
+          ),
+        queries_score_mode.getOrElse(elastic_client.queries_score_mode, ScoreMode.Max)
+      ).ignoreUnmapped(true).innerHit(new InnerHitBuilder().setSize(10000), true)
+      bool_query_builder.must(nested_query)
     }
 
     search_builder.setQuery(bool_query_builder)
@@ -202,7 +89,8 @@ class DecisionTableService(implicit val executionContext: ExecutionContext) {
       .execute()
       .actionGet()
 
-    val documents : Option[List[SearchDTDocument]] = Option { search_response.getHits.getHits.toList.map( { case(e) =>
+    val documents : Option[List[SearchDTDocument]] =
+      Option { search_response.getHits.getHits.toList.map( { case(e) =>
 
       val item: SearchHit = e
 
@@ -210,19 +98,31 @@ class DecisionTableService(implicit val executionContext: ExecutionContext) {
 
       val source : Map[String, Any] = item.getSource.asScala.toMap
 
+        val execution_order: Int = source.get("execution_order") match {
+        case Some(t) => t.asInstanceOf[Int]
+        case None => 0
+      }
+
       val max_state_count : Int = source.get("max_state_count") match {
         case Some(t) => t.asInstanceOf[Int]
         case None => 0
       }
 
-      val regex : String = source.get("regex") match {
+     val analyzer : String = source.get("analyzer") match {
         case Some(t) => t.asInstanceOf[String]
         case None => ""
       }
 
       val queries : List[String] = source.get("queries") match {
-        case Some(t) => t.asInstanceOf[java.util.ArrayList[String]].asScala.toList
-        case None => List[String]()
+        case Some(t) =>
+          val offsets = e.getInnerHits.get("queries").getHits.toList.map(inner_hit => {
+            inner_hit.getNestedIdentity.getOffset
+          })
+          val query_array = t.asInstanceOf[java.util.ArrayList[java.util.HashMap[String, String]]].asScala.toList
+            .map(q_e => q_e.get("query"))
+          val queries_ordered : List[String] = offsets.map(i => query_array(i))
+          queries_ordered
+        case None => List.empty[String]
       }
 
       val bubble : String = source.get("bubble") match {
@@ -255,12 +155,13 @@ class DecisionTableService(implicit val executionContext: ExecutionContext) {
         case None => ""
       }
 
-      val document : DTDocument = DTDocument(state = state, max_state_count = max_state_count,
-        regex = regex, queries = queries, bubble = bubble,
+      val document : DTDocument = DTDocument(state = state, execution_order = execution_order,
+        max_state_count = max_state_count,
+        analyzer = analyzer, queries = queries, bubble = bubble,
         action = action, action_input = action_input, state_data = state_data,
         success_value = success_value, failure_value = failure_value)
 
-      val search_document : SearchDTDocument = SearchDTDocument(score = item.score, document = document)
+      val search_document : SearchDTDocument = SearchDTDocument(score = item.getScore, document = document)
       search_document
     }) }
 
@@ -275,13 +176,20 @@ class DecisionTableService(implicit val executionContext: ExecutionContext) {
     search_results_option
   }
 
-  def create(document: DTDocument): Future[Option[IndexDocumentResult]] = Future {
+  def create(document: DTDocument, refresh: Int): Future[Option[IndexDocumentResult]] = Future {
     val builder : XContentBuilder = jsonBuilder().startObject()
 
     builder.field("state", document.state)
+    builder.field("execution_order", document.execution_order)
     builder.field("max_state_count", document.max_state_count)
-    builder.field("regex", document.regex)
-    builder.array("queries", document.queries:_*)
+    builder.field("analyzer", document.analyzer)
+
+    val array = builder.startArray("queries")
+    document.queries.foreach(q => {
+      array.startObject().field("query", q).endObject()
+    })
+    array.endArray()
+
     builder.field("bubble", document.bubble)
     builder.field("action", document.action)
 
@@ -298,28 +206,37 @@ class DecisionTableService(implicit val executionContext: ExecutionContext) {
 
     builder.endObject()
 
-    val json: String = builder.string()
     val client: TransportClient = elastic_client.get_client()
-    val response: IndexResponse = client.prepareIndex(elastic_client.index_name, elastic_client.type_name,
-                                                          document.state)
-      .setSource(json)
-      .get()
+    val response = client.prepareIndex(elastic_client.index_name,
+      elastic_client.type_name, document.state).setSource(builder).get()
+
+    if (refresh != 0) {
+      val refresh_index = elastic_client.refresh_index()
+      if(refresh_index.failed_shards_n > 0) {
+        throw new Exception("DecisionTable : index refresh failed: (" + elastic_client.index_name + ")")
+      }
+    }
 
     val doc_result: IndexDocumentResult = IndexDocumentResult(index = response.getIndex,
       dtype = response.getType,
       id = response.getId,
       version = response.getVersion,
-      created = (response.status == Result.CREATED)
+      created = response.status == RestStatus.CREATED
     )
 
     Option {doc_result}
   }
 
-  def update(id: String, document: DTDocumentUpdate): Future[Option[UpdateDocumentResult]] = Future {
+  def update(id: String, document: DTDocumentUpdate, refresh: Int): Future[Option[UpdateDocumentResult]] = Future {
     val builder : XContentBuilder = jsonBuilder().startObject()
 
-    document.regex match {
-      case Some(t) => builder.field("regex", t)
+    document.analyzer match {
+      case Some(t) => builder.field("analyzer", t)
+      case None => ;
+    }
+
+    document.execution_order match {
+      case Some(t) => builder.field("execution_order", t)
       case None => ;
     }
     document.max_state_count match {
@@ -328,8 +245,13 @@ class DecisionTableService(implicit val executionContext: ExecutionContext) {
     }
     document.queries match {
       case Some(t) =>
-        builder.array("queries", t:_*)
-          case None => ;
+
+        val array = builder.startArray("queries")
+        t.foreach(q => {
+          array.startObject().field("query", q).endObject()
+        })
+        array.endArray()
+      case None => ;
     }
     document.bubble match {
       case Some(t) => builder.field("bubble", t)
@@ -368,25 +290,39 @@ class DecisionTableService(implicit val executionContext: ExecutionContext) {
       .setDoc(builder)
       .get()
 
+    if (refresh != 0) {
+      val refresh_index = elastic_client.refresh_index()
+      if(refresh_index.failed_shards_n > 0) {
+        throw new Exception("DecisionTable : index refresh failed: (" + elastic_client.index_name + ")")
+      }
+    }
+
     val doc_result: UpdateDocumentResult = UpdateDocumentResult(index = response.getIndex,
       dtype = response.getType,
       id = response.getId,
       version = response.getVersion,
-      created = (response.status == Result.CREATED)
+      created = response.status == RestStatus.CREATED
     )
 
     Option {doc_result}
   }
 
-  def delete(id: String): Future[Option[DeleteDocumentResult]] = Future {
+  def delete(id: String, refresh: Int): Future[Option[DeleteDocumentResult]] = Future {
     val client: TransportClient = elastic_client.get_client()
     val response: DeleteResponse = client.prepareDelete(elastic_client.index_name, elastic_client.type_name, id).get()
+
+    if (refresh != 0) {
+      val refresh_index = elastic_client.refresh_index()
+      if(refresh_index.failed_shards_n > 0) {
+        throw new Exception("DecisionTable : index refresh failed: (" + elastic_client.index_name + ")")
+      }
+    }
 
     val doc_result: DeleteDocumentResult = DeleteDocumentResult(index = response.getIndex,
       dtype = response.getType,
       id = response.getId,
       version = response.getVersion,
-      found = (response.status != Result.NOT_FOUND)
+      found = response.status != RestStatus.NOT_FOUND
     )
 
     Option {doc_result}
@@ -407,18 +343,24 @@ class DecisionTableService(implicit val executionContext: ExecutionContext) {
 
       val source : Map[String, Any] = item.getSource.asScala.toMap
 
+      val execution_order : Int = source.get("execution_order") match {
+        case Some(t) => t.asInstanceOf[Int]
+        case None => 0
+      }
+
       val max_state_count : Int = source.get("max_state_count") match {
         case Some(t) => t.asInstanceOf[Int]
         case None => 0
       }
 
-      val regex : String = source.get("regex") match {
+      val analyzer : String = source.get("analyzer") match {
         case Some(t) => t.asInstanceOf[String]
         case None => ""
       }
 
       val queries : List[String] = source.get("queries") match {
-        case Some(t) => t.asInstanceOf[java.util.ArrayList[String]].asScala.toList
+        case Some(t) => t.asInstanceOf[java.util.ArrayList[java.util.HashMap[String, String]]]
+          .asScala.map(_.getOrDefault("query", null)).filter(_ != null).toList
         case None => List[String]()
       }
 
@@ -452,8 +394,9 @@ class DecisionTableService(implicit val executionContext: ExecutionContext) {
         case None => ""
       }
 
-      val document : DTDocument = DTDocument(state = state, max_state_count = max_state_count,
-        regex = regex, queries = queries, bubble = bubble,
+      val document : DTDocument = DTDocument(state = state, execution_order = execution_order,
+        max_state_count = max_state_count,
+        analyzer = analyzer, queries = queries, bubble = bubble,
         action = action, action_input = action_input, state_data = state_data,
         success_value = success_value, failure_value = failure_value)
 
@@ -471,5 +414,4 @@ class DecisionTableService(implicit val executionContext: ExecutionContext) {
     val search_results_option : Future[Option[SearchDTDocumentsResults]] = Future { Option { search_results } }
     search_results_option
   }
-
 }
