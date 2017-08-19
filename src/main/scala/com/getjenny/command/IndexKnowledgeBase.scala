@@ -66,7 +66,7 @@ object IndexKnowledgeBase extends JsonSupport {
       }
     }).filter(_._2).map(x => (x._3, x._4)).toMap
 
-    val answers_input_stream: Reader = new InputStreamReader(new FileInputStream(params.questions_path.get), "UTF-8")
+    val answers_input_stream: Reader = new InputStreamReader(new FileInputStream(params.answers_path.get), "UTF-8")
     lazy val answers_entries = CSVReader.read(input = answers_input_stream, separator = params.separator,
       quote = '"', skipLines = 0)
 
@@ -130,11 +130,13 @@ object IndexKnowledgeBase extends JsonSupport {
         conversation = entry("conversation_id"),
         index_in_conversation =  Option { entry("position").toInt },
         question = entry("question"),
+        question_negative = None: Option[List[String]],
         question_scored_terms = None: Option[List[(String, Double)]],
         answer = entry("answer"),
         answer_scored_terms = None: Option[List[(String, Double)]],
         verified = false,
         topics = None: Option[String],
+        dclass = None: Option[String],
         doctype = doctypes.normal,
         state = None: Option[String],
         status = 0

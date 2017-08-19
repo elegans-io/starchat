@@ -1,8 +1,19 @@
 language: scala
 scala:
-   - 2.11.8
-   - 2.12.1
+   - 2.12.2
 jdk:
    - oraclejdk8
+sudo: required
+services:
+  - docker
 script:
+   - sbt ++$TRAVIS_SCALA_VERSION dockerComposeUp
    - sbt ++$TRAVIS_SCALA_VERSION test
+   - sbt ++$TRAVIS_SCALA_VERSION dockerComposeStop
+notifications:
+  webhooks:
+    urls:
+      - https://webhooks.gitter.im/e/15b5367e5ba965a65a9a
+    on_success: change
+    on_failure: always
+    on_start: never
